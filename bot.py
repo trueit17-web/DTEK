@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import random
+import re
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 from zoneinfo import ZoneInfo
@@ -34,6 +35,7 @@ import aiohttp
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
+from aiohttp import web
 
 # =====================================================================
 # КОНФИГУРАЦИЯ (Днепр, группа 3.1 + EcoFlow DELTA Pro 3)
@@ -70,6 +72,19 @@ NOTIFY_CHAT_IDS: Set[int] = {
 MONITOR_INTERVAL_SEC = max(30, int(os.getenv("MONITOR_INTERVAL_SEC", "60")))
 LOW_BATTERY_SOC = float(os.getenv("LOW_BATTERY_SOC", "20"))
 NOTIFY_SCHEDULE_CHANGES = os.getenv("NOTIFY_SCHEDULE_CHANGES", "1").lower() in ("1", "true", "yes", "on")
+
+# WhatsApp через шлюз WAHA (https://waha.devlike.pro), запускается рядом в docker compose
+WHATSAPP_ENABLED = os.getenv("WHATSAPP_ENABLED", "0").lower() in ("1", "true", "yes", "on")
+WAHA_URL = os.getenv("WAHA_URL", "http://waha:3000").rstrip("/")
+WAHA_API_KEY = os.getenv("WAHA_API_KEY", "")
+WAHA_SESSION = os.getenv("WAHA_SESSION", "default")
+# ID групп/чатов WhatsApp через запятую (вида 120363...@g.us). Узнать: написать «id» в группе.
+WHATSAPP_CHAT_IDS: List[str] = [
+    x.strip() for x in os.getenv("WHATSAPP_CHAT_IDS", "").split(",") if x.strip()
+]
+WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8080"))
+
+STATUS_WORDS = {"статус", "status", "свет", "график", "экофлоу", "/status"}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -555,6 +570,132 @@ async def build_status_report() -> str:
 
 
 # =====================================================================
+# 3.1. WHATSAPP (WAHA)
+# =====================================================================
+def html_to_whatsapp(text: str) -> str:
+    """Переводит HTML-разметку Telegram в разметку WhatsApp (*жирный*, _курсив_, `код`)."""
+    text = re.sub(r"</?b>", "*", text)
+    text = re.sub(r"</?i>", "_", text)
+    text = re.sub(r"</?code>", "`", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    return html.unescape(text)
+
+
+def _waha_headers() -> Dict[str, str]:
+    return {"X-Api-Key": WAHA_API_KEY} if WAHA_API_KEY else {}
+
+
+async def wa_send(chat_id: str, html_text: str) -> None:
+    """Отправляет сообщение в чат/группу WhatsApp через WAHA."""
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{WAHA_URL}/api/sendText",
+            json={"session": WAHA_SESSION, "chatId": chat_id, "text": html_to_whatsapp(html_text)},
+            headers=_waha_headers(),
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            if resp.status >= 300:
+                raise RuntimeError(f"WAHA sendText HTTP {resp.status}: {(await resp.text())[:200]}")
+
+
+async def wa_session_status() -> str:
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{WAHA_URL}/api/sessions/{WAHA_SESSION}",
+            headers=_waha_headers(),
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            data = await resp.json(content_type=None)
+    return str(data.get("status", "UNKNOWN"))
+
+
+async def wa_get_qr_png() -> bytes:
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{WAHA_URL}/api/{WAHA_SESSION}/auth/qr",
+            headers={**_waha_headers(), "Accept": "image/png"},
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"QR недоступен (HTTP {resp.status}): {(await resp.text())[:200]}")
+            return await resp.read()
+
+
+async def _wa_handle_message(payload: Dict[str, Any]) -> None:
+    chat_id = str(payload.get("from") or "")
+    body = str(payload.get("body") or "").strip().lower()
+    if not chat_id or not body:
+        return
+
+    if body in ("id", "/id", "айди"):
+        await wa_send(chat_id, f"ID этого чата: <code>{chat_id}</code>")
+        return
+
+    if body in STATUS_WORDS:
+        if WHATSAPP_CHAT_IDS and chat_id not in WHATSAPP_CHAT_IDS:
+            logger.info("WhatsApp: запрос статуса из чужого чата %s — игнорирую", chat_id)
+            return
+        try:
+            report = await build_status_report()
+        except Exception as exc:
+            logger.exception("Ошибка формирования отчета для WhatsApp")
+            report = f"⚠️ Не удалось сформировать отчет: {html.escape(str(exc))}"
+        await wa_send(chat_id, report)
+
+
+_wa_last_status: Optional[str] = None
+
+
+async def waha_webhook(request: web.Request) -> web.Response:
+    """Принимает события от WAHA: входящие сообщения и смену статуса сессии."""
+    global _wa_last_status
+    try:
+        event = await request.json()
+    except Exception:
+        return web.Response(status=400)
+
+    kind = event.get("event")
+    payload = event.get("payload") or {}
+
+    if kind == "message" and not payload.get("fromMe"):
+        asyncio.create_task(_safe(_wa_handle_message(payload)))
+    elif kind == "session.status":
+        status = str(payload.get("status"))
+        logger.info("WhatsApp: статус сессии %s", status)
+        bot: Optional[Bot] = request.app.get("bot")
+        if _wa_last_status == "WORKING" and status in ("SCAN_QR_CODE", "FAILED", "STOPPED"):
+            await _notify_telegram(
+                bot,
+                f"⚠️ WhatsApp отключился (статус {status}). "
+                "Подключите заново: /wa_qr и отсканируйте QR в WhatsApp → Связанные устройства.",
+            )
+        elif status == "WORKING" and _wa_last_status not in (None, "WORKING"):
+            await _notify_telegram(bot, "✅ WhatsApp подключен.")
+        _wa_last_status = status
+
+    return web.Response(text="ok")
+
+
+async def _safe(coro: Any) -> None:
+    try:
+        await coro
+    except Exception:
+        logger.exception("Ошибка обработки WhatsApp-сообщения")
+
+
+async def start_webhook_server(bot: Optional[Bot]) -> web.AppRunner:
+    app = web.Application()
+    app["bot"] = bot
+    app.router.add_post("/waha", waha_webhook)
+    app.router.add_get("/health", lambda _: web.Response(text="ok"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT).start()
+    logger.info("Webhook для WhatsApp слушает порт %s", WEBHOOK_PORT)
+    return runner
+
+
+# =====================================================================
 # 4. ОБРАБОТЧИКИ TELEGRAM-БОТА
 # =====================================================================
 dp = Dispatcher()
@@ -572,6 +713,49 @@ async def cmd_id(message: types.Message) -> None:
     """Показывает Telegram ID пользователя (нужен для ALLOWED_USER_IDS)."""
     user_id = message.from_user.id if message.from_user else "неизвестно"
     await message.answer(f"Ваш Telegram ID: <code>{user_id}</code>", parse_mode=ParseMode.HTML)
+
+
+@dp.message(Command("wa_qr"))
+async def cmd_wa_qr(message: types.Message) -> None:
+    """Присылает QR-код для подключения WhatsApp (только разрешенным пользователям)."""
+    if not ALLOWED_USER_IDS or not _is_allowed(message):
+        await message.answer("⛔ Команда доступна только пользователям из ALLOWED_USER_IDS.")
+        return
+    if not WHATSAPP_ENABLED:
+        await message.answer("WhatsApp выключен (WHATSAPP_ENABLED=0).")
+        return
+    try:
+        status = await wa_session_status()
+        if status == "WORKING":
+            await message.answer("✅ WhatsApp уже подключен.")
+            return
+        png = await wa_get_qr_png()
+    except Exception as exc:
+        await message.answer(f"⚠️ Не удалось получить QR: {exc}")
+        return
+    await message.answer_photo(
+        types.BufferedInputFile(png, filename="qr.png"),
+        caption=(
+            "Откройте WhatsApp на телефоне с номером для бота → Настройки → "
+            "Связанные устройства → Привязать устройство и отсканируйте код. "
+            "Код живет ~20 секунд; если не успели — отправьте /wa_qr еще раз."
+        ),
+    )
+
+
+@dp.message(Command("wa_status"))
+async def cmd_wa_status(message: types.Message) -> None:
+    if not _is_allowed(message):
+        return
+    if not WHATSAPP_ENABLED:
+        await message.answer("WhatsApp выключен (WHATSAPP_ENABLED=0).")
+        return
+    try:
+        status = await wa_session_status()
+    except Exception as exc:
+        status = f"нет связи со шлюзом ({exc})"
+    chats = ", ".join(WHATSAPP_CHAT_IDS) or "не заданы (WHATSAPP_CHAT_IDS)"
+    await message.answer(f"WhatsApp: {status}\nГруппы для уведомлений: {chats}")
 
 
 @dp.message(Command("start", "help"))
@@ -614,7 +798,9 @@ async def handle_status(message: types.Message) -> None:
 # =====================================================================
 # 5. ФОНОВЫЙ МОНИТОРИНГ И УВЕДОМЛЕНИЯ
 # =====================================================================
-async def _notify(bot: Bot, text: str) -> None:
+async def _notify_telegram(bot: Optional[Bot], text: str) -> None:
+    if bot is None:
+        return
     for chat_id in NOTIFY_CHAT_IDS:
         try:
             await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
@@ -622,7 +808,18 @@ async def _notify(bot: Bot, text: str) -> None:
             logger.warning("Не удалось отправить уведомление в чат %s", chat_id, exc_info=True)
 
 
-async def monitor_loop(bot: Bot) -> None:
+async def _notify(bot: Optional[Bot], text: str) -> None:
+    """Рассылает уведомление в Telegram и в группы WhatsApp."""
+    await _notify_telegram(bot, text)
+    if WHATSAPP_ENABLED:
+        for chat_id in WHATSAPP_CHAT_IDS:
+            try:
+                await wa_send(chat_id, text)
+            except Exception:
+                logger.warning("Не удалось отправить уведомление в WhatsApp %s", chat_id, exc_info=True)
+
+
+async def monitor_loop(bot: Optional[Bot]) -> None:
     """
     Раз в MONITOR_INTERVAL_SEC опрашивает станцию и график и присылает уведомления:
       - пропал свет (станция перешла на батарею) / свет появился;
@@ -635,8 +832,9 @@ async def monitor_loop(bot: Bot) -> None:
     low_battery_sent = False
     last_schedule: Optional[str] = None
     logger.info(
-        "Мониторинг включен: интервал %s с, уведомления в чаты %s",
-        MONITOR_INTERVAL_SEC, sorted(NOTIFY_CHAT_IDS),
+        "Мониторинг включен: интервал %s с, Telegram: %s, WhatsApp: %s",
+        MONITOR_INTERVAL_SEC, sorted(NOTIFY_CHAT_IDS) if bot else "-",
+        WHATSAPP_CHAT_IDS if WHATSAPP_ENABLED else "-",
     )
 
     while True:
@@ -711,19 +909,31 @@ async def monitor_loop(bot: Bot) -> None:
 
 
 async def main() -> None:
-    if TELEGRAM_BOT_TOKEN in ("", "YOUR_TELEGRAM_BOT_TOKEN"):
-        logger.error("Задайте переменную окружения TELEGRAM_BOT_TOKEN перед запуском!")
+    has_telegram = TELEGRAM_BOT_TOKEN not in ("", "YOUR_TELEGRAM_BOT_TOKEN")
+    if not has_telegram and not WHATSAPP_ENABLED:
+        logger.error("Задайте TELEGRAM_BOT_TOKEN и/или включите WhatsApp (WHATSAPP_ENABLED=1)!")
         raise SystemExit(1)
 
-    bot = Bot(token=TELEGRAM_BOT_TOKEN)
-    logger.info("Бот запущен (Днепр, группа %s | EcoFlow DELTA Pro 3)...", DTEK_GROUP)
+    bot = Bot(token=TELEGRAM_BOT_TOKEN) if has_telegram else None
+    logger.info(
+        "Бот запущен (Днепр, группа %s | EcoFlow DELTA Pro 3) | Telegram: %s | WhatsApp: %s",
+        DTEK_GROUP, "да" if bot else "нет", "да" if WHATSAPP_ENABLED else "нет",
+    )
 
-    if NOTIFY_CHAT_IDS:
+    if WHATSAPP_ENABLED:
+        await start_webhook_server(bot)
+        if not WHATSAPP_CHAT_IDS:
+            logger.warning("WHATSAPP_CHAT_IDS не задан: напишите «id» в нужной группе WhatsApp и впишите ID в .env")
+
+    if (bot and NOTIFY_CHAT_IDS) or (WHATSAPP_ENABLED and WHATSAPP_CHAT_IDS):
         asyncio.create_task(monitor_loop(bot))
     else:
-        logger.info("Уведомления выключены: задайте ALLOWED_USER_IDS или NOTIFY_CHAT_IDS")
+        logger.info("Уведомления выключены: задайте ALLOWED_USER_IDS/NOTIFY_CHAT_IDS или WHATSAPP_CHAT_IDS")
 
-    await dp.start_polling(bot)
+    if bot:
+        await dp.start_polling(bot)
+    else:
+        await asyncio.Event().wait()  # только WhatsApp: просто держим процесс
 
 
 if __name__ == "__main__":

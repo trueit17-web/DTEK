@@ -45,7 +45,7 @@ ask() {  # ask VAR "Вопрос" [default]
 if [ ! -f .env ]; then
     say "Настройка бота (значения сохранятся в $INSTALL_DIR/.env)"
     : > .env
-    ask TELEGRAM_BOT_TOKEN  "Токен Telegram-бота от @BotFather"
+    ask TELEGRAM_BOT_TOKEN  "Токен Telegram-бота от @BotFather (пусто — без Telegram)"
     ask ECOFLOW_ACCESS_KEY  "EcoFlow Access Key (developer-eu.ecoflow.com)"
     ask ECOFLOW_SECRET_KEY  "EcoFlow Secret Key"
     ask ECOFLOW_DEVICE_SN   "Серийный номер станции DELTA Pro 3 (MR51...)"
@@ -60,6 +60,18 @@ MONITOR_INTERVAL_SEC=60
 LOW_BATTERY_SOC=20
 NOTIFY_SCHEDULE_CHANGES=1
 ENV
+    read -r -p "Подключить WhatsApp (уведомления в группу)? [y/N]: " wa </dev/tty || true
+    if [[ "${wa:-n}" =~ ^[YyДд] ]]; then
+        key="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+        {
+            echo "COMPOSE_PROFILES=whatsapp"
+            echo "WHATSAPP_ENABLED=1"
+            echo "WAHA_API_KEY=$key"
+            echo "WHATSAPP_CHAT_IDS="
+        } >> .env
+    else
+        printf 'COMPOSE_PROFILES=\nWHATSAPP_ENABLED=0\nWAHA_API_KEY=\nWHATSAPP_CHAT_IDS=\n' >> .env
+    fi
     chmod 600 .env
 else
     say "Файл .env уже есть, оставляю его как есть."
@@ -70,3 +82,21 @@ say "Собираю и запускаю контейнер..."
 docker compose up -d --build
 
 say "Готово! Логи: cd $INSTALL_DIR && docker compose logs -f"
+
+if grep -q '^WHATSAPP_ENABLED=1' .env; then
+    cat <<'TXT'
+
+==================== WhatsApp ====================
+1. На телефоне с ОТДЕЛЬНЫМ номером для бота откройте WhatsApp →
+   Настройки → Связанные устройства → Привязать устройство.
+2. Отсканируйте QR-код, который появится ниже (он обновляется каждые ~20 с).
+   Если QR в терминале не читается — отправьте Telegram-боту команду /wa_qr.
+3. Добавьте этот номер в нужную группу WhatsApp и напишите в группе «id».
+   Бот ответит ID группы — впишите его в .env:  WHATSAPP_CHAT_IDS=...@g.us
+   и выполните:  docker compose up -d
+После сканирования нажмите Ctrl+C (бот продолжит работать).
+==================================================
+TXT
+    sleep 5
+    docker compose logs -f --tail 60 waha || true
+fi

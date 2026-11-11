@@ -9,3 +9,28 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  # Шлюз WhatsApp (WAHA). Включается строкой COMPOSE_PROFILES=whatsapp в .env
+  waha:
+    image: devlikeapro/waha:latest
+    container_name: dtek-waha
+    profiles: ["whatsapp"]
+    restart: unless-stopped
+    environment:
+      WAHA_API_KEY: ${WAHA_API_KEY:-}
+      WHATSAPP_API_KEY: ${WAHA_API_KEY:-}
+      WHATSAPP_START_SESSION: default
+      WHATSAPP_RESTART_ALL_SESSIONS: "True"
+      WHATSAPP_HOOK_URL: http://bot:8080/waha
+      WHATSAPP_HOOK_EVENTS: message,session.status
+      WAHA_DASHBOARD_ENABLED: "false"
+      WHATSAPP_SWAGGER_ENABLED: "false"
+      WAHA_PRINT_QR: "True"
+      TZ: Europe/Kyiv
+    volumes:
+      - ./data/waha-sessions:/app/.sessions
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
