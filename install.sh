@@ -17,7 +17,26 @@ if ! command -v docker >/dev/null 2>&1; then
     say "Устанавливаю Docker..."
     curl -fsSL https://get.docker.com | sh
 fi
-docker compose version >/dev/null 2>&1 || die "нет плагина docker compose. Установите docker-compose-plugin."
+if ! docker compose version >/dev/null 2>&1; then
+    say "Устанавливаю плагин docker compose..."
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -qq || true
+        apt-get install -y -qq docker-compose-plugin >/dev/null 2>&1 \
+            || apt-get install -y -qq docker-compose-v2 >/dev/null 2>&1 || true
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y -q docker-compose-plugin >/dev/null 2>&1 || true
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y -q docker-compose-plugin >/dev/null 2>&1 || true
+    fi
+fi
+if ! docker compose version >/dev/null 2>&1; then
+    say "Пакета нет в репозитории, скачиваю docker compose с GitHub..."
+    mkdir -p /usr/local/lib/docker/cli-plugins
+    curl -fsSL "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-$(uname -m)" \
+        -o /usr/local/lib/docker/cli-plugins/docker-compose
+    chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+fi
+docker compose version >/dev/null 2>&1 || die "не удалось установить docker compose."
 command -v git >/dev/null 2>&1 || { say "Устанавливаю git..."; (apt-get update && apt-get install -y git) || die "установите git вручную."; }
 
 # 2. Код
