@@ -27,6 +27,7 @@ import logging
 import os
 import random
 import re
+import sys
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 from zoneinfo import ZoneInfo
@@ -609,6 +610,85 @@ async def wa_session_status() -> str:
     return str(data.get("status", "UNKNOWN"))
 
 
+async def wa_request_code(phone: str) -> str:
+    """
+    Запрашивает код привязки по номеру телефона (вместо сканирования QR).
+    Код вводится в WhatsApp: Связанные устройства → Привязать устройство →
+    «Привязать по номеру телефона».
+    """
+    digits = re.sub(r"\D", "", phone)
+    if len(digits) < 10:
+        raise ValueError("укажите номер полностью, с кодом страны, например 380501234567")
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{WAHA_URL}/api/{WAHA_SESSION}/auth/request-code",
+            json={"phoneNumber": digits},
+            headers=_waha_headers(),
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            data = await resp.json(content_type=None)
+            if resp.status >= 300 or not data.get("code"):
+                raise RuntimeError(f"WAHA HTTP {resp.status}: {str(data)[:200]}")
+    return str(data["code"])
+
+
+async def wa_wait_ready_for_link(timeout_sec: int = 300) -> str:
+    """Ждет, пока шлюз запустится и будет готов к привязке (или уже подключен)."""
+    deadline = time.monotonic() + timeout_sec
+    status = "UNKNOWN"
+    while time.monotonic() < deadline:
+        try:
+            status = await wa_session_status()
+            if status in ("SCAN_QR_CODE", "WORKING"):
+                return status
+        except Exception:
+            pass
+        await asyncio.sleep(3)
+    return status
+
+
+WA_CODE_HELP = (
+    "На телефоне с номером бота откройте WhatsApp → Настройки → Связанные устройства → "
+    "Привязать устройство → внизу «Привязать по номеру телефона» и введите код."
+)
+
+
+async def cli_wa_link(phone: Optional[str]) -> int:
+    """Консольная привязка WhatsApp: python bot.py wa-link 380XXXXXXXXX"""
+    if not WHATSAPP_ENABLED:
+        print("WhatsApp выключен: в .env нужно WHATSAPP_ENABLED=1 и COMPOSE_PROFILES=whatsapp")
+        return 1
+    print("Жду запуска шлюза WhatsApp (первый запуск может занять 1–3 минуты)...", flush=True)
+    status = await wa_wait_ready_for_link()
+    if status == "WORKING":
+        print("✅ WhatsApp уже подключен.")
+        return 0
+    if status != "SCAN_QR_CODE":
+        print(f"⚠️ Шлюз не готов (статус {status}). Посмотрите логи: docker compose logs waha")
+        return 1
+    while not phone:
+        phone = input("Номер телефона бота с кодом страны (например 380501234567): ").strip()
+    try:
+        code = await wa_request_code(phone)
+    except Exception as exc:
+        print(f"⚠️ Не удалось получить код: {exc}")
+        return 1
+    print(f"\n   КОД ПРИВЯЗКИ:  {code}\n")
+    print(WA_CODE_HELP)
+    print("Жду подключения (до 3 минут)...", flush=True)
+    deadline = time.monotonic() + 180
+    while time.monotonic() < deadline:
+        await asyncio.sleep(3)
+        try:
+            if await wa_session_status() == "WORKING":
+                print("✅ WhatsApp подключен! Добавьте номер бота в группу и напишите там «id».")
+                return 0
+        except Exception:
+            pass
+    print("Подключение не подтвердилось. Запустите команду еще раз, чтобы получить новый код.")
+    return 1
+
+
 async def wa_get_qr_png() -> bytes:
     async with aiohttp.ClientSession() as session:
         async with session.get(
@@ -667,7 +747,7 @@ async def waha_webhook(request: web.Request) -> web.Response:
             await _notify_telegram(
                 bot,
                 f"⚠️ WhatsApp отключился (статус {status}). "
-                "Подключите заново: /wa_qr и отсканируйте QR в WhatsApp → Связанные устройства.",
+                "Подключите заново: /wa_code НОМЕР (или /wa_qr), либо на сервере ./wa-link.sh",
             )
         elif status == "WORKING" and _wa_last_status not in (None, "WORKING"):
             await _notify_telegram(bot, "✅ WhatsApp подключен.")
@@ -740,6 +820,33 @@ async def cmd_wa_qr(message: types.Message) -> None:
             "Связанные устройства → Привязать устройство и отсканируйте код. "
             "Код живет ~20 секунд; если не успели — отправьте /wa_qr еще раз."
         ),
+    )
+
+
+@dp.message(Command("wa_code"))
+async def cmd_wa_code(message: types.Message) -> None:
+    """Код привязки WhatsApp по номеру: /wa_code 380501234567"""
+    if not ALLOWED_USER_IDS or not _is_allowed(message):
+        await message.answer("⛔ Команда доступна только пользователям из ALLOWED_USER_IDS.")
+        return
+    if not WHATSAPP_ENABLED:
+        await message.answer("WhatsApp выключен (WHATSAPP_ENABLED=0).")
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Укажите номер бота с кодом страны: /wa_code 380501234567")
+        return
+    try:
+        status = await wa_session_status()
+        if status == "WORKING":
+            await message.answer("✅ WhatsApp уже подключен.")
+            return
+        code = await wa_request_code(parts[1])
+    except Exception as exc:
+        await message.answer(f"⚠️ Не удалось получить код: {html.escape(str(exc))}")
+        return
+    await message.answer(
+        f"Код привязки: <code>{code}</code>\n\n{WA_CODE_HELP}", parse_mode=ParseMode.HTML
     )
 
 
@@ -937,4 +1044,6 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "wa-link":
+        sys.exit(asyncio.run(cli_wa_link(sys.argv[2] if len(sys.argv) > 2 else None)))
     asyncio.run(main())

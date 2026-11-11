@@ -103,19 +103,19 @@ docker compose up -d --build
 say "Готово! Логи: cd $INSTALL_DIR && docker compose logs -f"
 
 if grep -q '^WHATSAPP_ENABLED=1' .env; then
+    echo
+    say "Привязка WhatsApp"
+    echo "Нужен ОТДЕЛЬНЫЙ номер для бота с установленным WhatsApp."
+    read -r -p "Номер бота с кодом страны (например 380501234567, пусто — привязать позже): " wa_phone </dev/tty || true
+    if [ -n "${wa_phone:-}" ]; then
+        docker compose exec -T bot python bot.py wa-link "$wa_phone" || true
+    fi
     cat <<'TXT'
 
-==================== WhatsApp ====================
-1. На телефоне с ОТДЕЛЬНЫМ номером для бота откройте WhatsApp →
-   Настройки → Связанные устройства → Привязать устройство.
-2. Отсканируйте QR-код, который появится ниже (он обновляется каждые ~20 с).
-   Если QR в терминале не читается — отправьте Telegram-боту команду /wa_qr.
-3. Добавьте этот номер в нужную группу WhatsApp и напишите в группе «id».
-   Бот ответит ID группы — впишите его в .env:  WHATSAPP_CHAT_IDS=...@g.us
-   и выполните:  docker compose up -d
-После сканирования нажмите Ctrl+C (бот продолжит работать).
-==================================================
+Привязать WhatsApp позже или заново:  ./wa-link.sh 380XXXXXXXXX
+  (или в Telegram-боте: /wa_code 380XXXXXXXXX, либо /wa_qr для QR-кода)
+Затем добавьте номер бота в группу WhatsApp и напишите в группе «id».
+Бот ответит ID группы — впишите его в .env:  WHATSAPP_CHAT_IDS=...@g.us
+и выполните:  docker compose up -d
 TXT
-    sleep 5
-    docker compose logs -f --tail 60 waha || true
 fi
