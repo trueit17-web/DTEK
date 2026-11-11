@@ -582,6 +582,16 @@ def html_to_whatsapp(text: str) -> str:
     return html.unescape(text)
 
 
+def _wa_error_text(exc: Exception) -> str:
+    """Понятное описание ошибки связи со шлюзом WhatsApp."""
+    if isinstance(exc, aiohttp.ClientConnectorError):
+        return (
+            "шлюз WhatsApp не запущен. На сервере выполните: "
+            "cd /opt/dtek-bot && sudo ./wa-link.sh НОМЕР_БОТА"
+        )
+    return str(exc)
+
+
 def _waha_headers() -> Dict[str, str]:
     return {"X-Api-Key": WAHA_API_KEY} if WAHA_API_KEY else {}
 
@@ -811,7 +821,7 @@ async def cmd_wa_qr(message: types.Message) -> None:
             return
         png = await wa_get_qr_png()
     except Exception as exc:
-        await message.answer(f"⚠️ Не удалось получить QR: {exc}")
+        await message.answer(f"⚠️ Не удалось получить QR: {_wa_error_text(exc)}")
         return
     await message.answer_photo(
         types.BufferedInputFile(png, filename="qr.png"),
@@ -843,7 +853,7 @@ async def cmd_wa_code(message: types.Message) -> None:
             return
         code = await wa_request_code(parts[1])
     except Exception as exc:
-        await message.answer(f"⚠️ Не удалось получить код: {html.escape(str(exc))}")
+        await message.answer(f"⚠️ Не удалось получить код: {html.escape(_wa_error_text(exc))}")
         return
     await message.answer(
         f"Код привязки: <code>{code}</code>\n\n{WA_CODE_HELP}", parse_mode=ParseMode.HTML
@@ -860,7 +870,7 @@ async def cmd_wa_status(message: types.Message) -> None:
     try:
         status = await wa_session_status()
     except Exception as exc:
-        status = f"нет связи со шлюзом ({exc})"
+        status = f"нет связи со шлюзом: {_wa_error_text(exc)}"
     chats = ", ".join(WHATSAPP_CHAT_IDS) or "не заданы (WHATSAPP_CHAT_IDS)"
     await message.answer(f"WhatsApp: {status}\nГруппы для уведомлений: {chats}")
 

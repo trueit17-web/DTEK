@@ -98,7 +98,7 @@ fi
 
 # 4. Запуск
 say "Собираю и запускаю контейнер..."
-docker compose up -d --build
+if grep -q "^WHATSAPP_ENABLED=1" .env; then docker compose --profile whatsapp up -d --build; else docker compose up -d --build; fi
 
 say "Готово! Логи: cd $INSTALL_DIR && docker compose logs -f"
 
