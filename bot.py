@@ -122,7 +122,8 @@ def _generate_ecoflow_headers(params: Optional[Dict[str, Any]] = None) -> Dict[s
         "nonce": nonce,
         "timestamp": timestamp,
         "sign": signature,
-        "Content-Type": "application/json;charset=UTF-8",
+        # Content-Type не передаем: на GET-запросах с параметрами EcoFlow из-за него
+        # отвечает «8521 signature is wrong».
     }
 
 
@@ -202,7 +203,14 @@ async def fetch_delta_pro_3_status(session: aiohttp.ClientSession) -> Dict[str, 
     ) as resp:
         payload = await resp.json(content_type=None)
 
-    if str(payload.get("code")) != "0":
+    code = str(payload.get("code"))
+    if code == "8512":
+        raise RuntimeError(
+            "станция не привязана к аккаунту разработчика EcoFlow (8512 no permission). "
+            "Проверьте, что ключи созданы в том же аккаунте EcoFlow, где станция добавлена в приложении, "
+            "и что серийный номер указан верно"
+        )
+    if code != "0":
         raise RuntimeError(
             f"EcoFlow API вернул код {payload.get('code')}: {payload.get('message')}"
         )
