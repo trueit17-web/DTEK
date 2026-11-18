@@ -265,8 +265,12 @@ async def fetch_delta_pro_3_status(session: aiohttp.ClientSession) -> Dict[str, 
     # Определяем режим работы EcoFlow DELTA Pro 3:
     # «grid» (Сеть) — если на входе AC есть мощность (ac_in_watts > 15 Вт),
     # либо присутствует сетевое напряжение AC >= 100 В, либо общий вход pow_in_sum > 15 Вт (без учета только солнечных панелей при 0 AC).
+    # flowInfoAcIn у DELTA Pro 3: 0 — сети на входе нет, >0 — сеть подключена
+    # (остается >0 даже при полной батарее и нулевой нагрузке, когда входная мощность 0 Вт).
+    flow_ac_in = _get_quota_float(q, ["flowInfoAcIn"], None)
     has_grid_power = (
-        (ac_in_watts > 15.0)
+        (flow_ac_in is not None and flow_ac_in > 0)
+        or (ac_in_watts > 15.0)
         or (ac_in_vol >= 100.0)
         or (ac_in_flag == 1.0 and pow_in_sum > 15.0)
         or (pow_in_sum > 15.0 and pv_watts == 0.0)
@@ -275,7 +279,8 @@ async def fetch_delta_pro_3_status(session: aiohttp.ClientSession) -> Dict[str, 
 
     # Расчет доступного запаса энергии (Вт·ч) с учетом нижнего порога разряда cmsMinDsgSoc
     usable_soc_pct = max(0.0, soc - min_dsg_soc)
-    remaining_wh = int(round((usable_soc_pct / 100.0) * DELTA_PRO_3_CAPACITY_WH))
+    capacity_wh = _get_quota_float(q, ["cmsBattFullEnergy"], None) or DELTA_PRO_3_CAPACITY_WH
+    remaining_wh = int(round((usable_soc_pct / 100.0) * capacity_wh))
 
     # Если станция отдает нагрузку, а cmsDsgRemTime равен 0 или техническому максимуму (5999 / 15999),
     # рассчитываем время до разряда аналитически по текущей мощности и доступной емкости DELTA Pro 3
@@ -304,24 +309,19 @@ async def fetch_delta_pro_3_status(session: aiohttp.ClientSession) -> Dict[str, 
         "chg_rem_min": chg_rem_min,
         "calculated_rem_min": calculated_rem_min,
         "chg_dsg_state": chg_dsg_state,
+        "flow_ac_in": flow_ac_in,
         "temp_min": int(round(temp_min)) if temp_min is not None else None,
         "temp_max": int(round(temp_max)) if temp_max is not None else None,
     }
 
 
 def format_duration_minutes(minutes: int, calculated_fallback: Optional[int] = None) -> str:
-    """Форматирует время до полного разряда с отсечением сервисной константы 15999 / 5999 мин."""
+    """Время до разряда; сервисные значения 5999/15999 мин отбрасываются (тогда берется расчет)."""
     valid_min = minutes if (0 < minutes < 5900) else (calculated_fallback or 0)
-    is_approx_calc = (minutes <= 0 or minutes >= 5900) and bool(calculated_fallback)
-
     if valid_min <= 0:
-        return "нет нагрузки (режим ожидания)"
-
+        return "нагрузки нет"
     hours, mins = divmod(valid_min, 60)
-    suffix = f" (расчет по ёмкости {int(DELTA_PRO_3_CAPACITY_WH)} Вт·ч)" if is_approx_calc else ""
-    if hours > 0:
-        return f"~{hours} ч {mins} мин{suffix}"
-    return f"~{mins} мин{suffix}"
+    return f"~{hours} ч {mins} мин" if hours else f"~{mins} мин"
 
 
 # =====================================================================
@@ -384,82 +384,83 @@ async def fetch_dtek_dnipro_schedule(
     session: aiohttp.ClientSession, region: str = DTEK_REGION, group: str = DTEK_GROUP
 ) -> str:
     """
-    Загружает актуальный график отключений ДТЭК для г. Днепр (группа 3.1 / GPV3.1)
-    из обновляемого JSON-хранилища ДТЭК (Baskerville42/outage-data-ua, файл dnipro.json).
+    Компактный график отключений ДТЭК для группы (данные: Baskerville42/outage-data-ua).
+    Показывает, есть ли свет по графику сейчас, когда ближайшее отключение
+    и оставшиеся интервалы на сегодня и завтра.
     """
     url = f"https://raw.githubusercontent.com/Baskerville42/outage-data-ua/main/data/{region}.json"
     async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
         if resp.status != 200:
-            raise RuntimeError(f"Ошибка HTTP {resp.status} при загрузке графика ДТЭК")
+            raise RuntimeError(f"HTTP {resp.status}")
         data = await resp.json(content_type=None)
 
-    fact = data.get("fact") or {}
-    fact_data: Dict[str, Any] = fact.get("data") or {}
-    update_time = fact.get("update") or fact.get("updateFact") or "неизвестно"
-
+    fact_data: Dict[str, Any] = (data.get("fact") or {}).get("data") or {}
     group_key = group if group.upper().startswith("GPV") else f"GPV{group}"
-    now_kyiv = datetime.datetime.now(KYIV_TZ)
-    current_slot_idx = min(47, (now_kyiv.hour * 60 + now_kyiv.minute) // 30)
+    now = datetime.datetime.now(KYIV_TZ)
+    today = now.date()
+    tomorrow = today + datetime.timedelta(days=1)
+    now_idx = min(47, (now.hour * 60 + now.minute) // 30)
 
-    sorted_timestamps = sorted(int(ts) for ts in fact_data.keys() if str(ts).isdigit())
-    if not sorted_timestamps:
-        return f"⚠️ График ДТЭК ({DTEK_CITY_TITLE}, группа <b>{group}</b>) сейчас недоступен."
+    days: Dict[datetime.date, List[str]] = {}
+    for ts, groups in fact_data.items():
+        if not str(ts).isdigit():
+            continue
+        day = datetime.datetime.fromtimestamp(int(ts), tz=KYIV_TZ).date()
+        slots = (groups or {}).get(group_key) or (groups or {}).get(group)
+        if day in (today, tomorrow) and slots:
+            days[day] = _parse_dtek_day_slots(slots)[1]
 
-    lines: List[str] = [
-        f"📅 <b>График ДТЭК — {DTEK_CITY_TITLE}</b>",
-        f"👥 Группа: <b>{group}</b> | <i>Обновлено: {update_time}</i>",
-    ]
+    header = f"📅 <b>ДТЭК, группа {group}</b>"
+    if today not in days:
+        return f"{header}\n⚠️ График на сегодня не опубликован"
 
-    for ts in sorted_timestamps:
-        day_dt = datetime.datetime.fromtimestamp(ts, tz=KYIV_TZ)
-        if day_dt.date() < now_kyiv.date():
-            continue  # прошедшие дни не показываем
-        day_label = day_dt.strftime("%d.%m.%Y")
-        is_today = day_dt.date() == now_kyiv.date()
-        is_tomorrow = day_dt.date() == (now_kyiv + datetime.timedelta(days=1)).date()
+    def intervals(half: List[str], from_idx: int = 0) -> List[Tuple[int, int, str]]:
+        res: List[Tuple[int, int, str]] = []
+        i = from_idx
+        while i < 48:
+            st = half[i]
+            if st in ("off", "maybe"):
+                j = i
+                while j < 48 and half[j] == st:
+                    j += 1
+                res.append((i, j, st))
+                i = j
+            else:
+                i += 1
+        return res
 
-        if is_today:
-            day_title = f"Сегодня ({day_label})"
-        elif is_tomorrow:
-            day_title = f"Завтра ({day_label})"
-        else:
-            day_title = day_label
-
-        day_groups = fact_data.get(str(ts)) or {}
-        group_slots = (
-            day_groups.get(group_key)
-            or day_groups.get(group)
-            or day_groups.get(group.replace(".", "_"))
+    def fmt(items: List[Tuple[int, int, str]]) -> str:
+        return ", ".join(
+            f"{_idx_to_time(a)}–{_idx_to_time(b)}" + (" (возможно)" if st == "maybe" else "")
+            for a, b, st in items
         )
 
-        if not group_slots:
-            lines.append(f"\n<b>{day_title}:</b> данные для группы {group} отсутствуют.")
-            continue
+    half_today = days[today]
+    cur = half_today[now_idx]
+    lines = [header]
 
-        intervals, half_hours = _parse_dtek_day_slots(group_slots)
-
-        # Показываем текущий статус по графику на сейчас
-        if is_today and 0 <= current_slot_idx < len(half_hours):
-            now_state = half_hours[current_slot_idx]
-            if now_state == "off":
-                lines.append("🔴 Сейчас по графику: <b>отключение электроэнергии</b>")
-            elif now_state == "maybe":
-                lines.append("🟡 Сейчас по графику: <b>возможное отключение</b>")
-            else:
-                lines.append("🟢 Сейчас по графику: <b>свет должен быть</b>")
-
-        if not intervals:
-            lines.append(f"\n🟢 <b>{day_title}:</b> отключений не запланировано")
+    if cur in ("off", "maybe"):
+        end = now_idx
+        while end < 48 and half_today[end] == cur:
+            end += 1
+        what = "🔴 Сейчас отключение" if cur == "off" else "🟡 Сейчас возможно отключение"
+        lines.append(f"{what} до <b>{_idx_to_time(end)}</b>")
+    else:
+        upcoming = intervals(half_today, now_idx)
+        if upcoming:
+            nxt = f"отключение в <b>{_idx_to_time(upcoming[0][0])}</b>"
+        elif tomorrow in days and intervals(days[tomorrow]):
+            nxt = f"отключение завтра в <b>{_idx_to_time(intervals(days[tomorrow])[0][0])}</b>"
         else:
-            total_off_half_hours = sum(1 for s in half_hours if s == "off")
-            off_hours = total_off_half_hours * 0.5
-            hours_str = f"{int(off_hours)}" if off_hours.is_integer() else f"{off_hours:.1f}"
-            lines.append(f"\n<b>{day_title}</b> (всего без света: {hours_str} ч):")
-            for start_t, end_t, slot_type in intervals:
-                icon = "🔴" if slot_type == "off" else "🟡"
-                label = "отключение" if slot_type == "off" else "возможное отключение"
-                lines.append(f"  {icon} <code>{start_t} – {end_t}</code> — {label}")
+            nxt = "отключений не ожидается"
+        lines.append(f"🟢 Сейчас свет есть · {nxt}")
 
+    # Сегодня — только еще не закончившиеся интервалы
+    left_today = [it for it in intervals(half_today) if it[1] > now_idx]
+    lines.append(f"Сегодня: {fmt(left_today) if left_today else 'больше без отключений'}")
+    if tomorrow in days:
+        tm = intervals(days[tomorrow])
+        lines.append(f"Завтра: {fmt(tm) if tm else 'без отключений'}")
     return "\n".join(lines)
 
 
@@ -488,94 +489,54 @@ async def fetch_dtek_group_fingerprint(
 # =====================================================================
 # 3. СБОРКА ИТОГОВОГО ОТЧЕТА ПО КОМАНДЕ «СТАТУС»
 # =====================================================================
-async def build_status_report() -> str:
-    """Запрашивает статус EcoFlow DELTA Pro 3 и график ДТЭК (Днепр, группа 3.1)."""
-    async with aiohttp.ClientSession() as session:
-        dtek_task = asyncio.create_task(
-            fetch_dtek_dnipro_schedule(session, DTEK_REGION, DTEK_GROUP)
-        )
-        ecoflow_task = asyncio.create_task(fetch_delta_pro_3_status(session))
+def _fmt_soc(soc: float) -> str:
+    return f"{int(soc)}%"  # 99.9 → 99%, без «округления до 100»
 
+
+def format_ecoflow_section(ef: Dict[str, Any]) -> str:
+    """Короткий блок о станции: режим, заряд, нагрузка, время работы."""
+    if "error" in ef:
+        return f"⚠️ EcoFlow: {html.escape(ef['error'])}"
+    if not ef.get("online"):
+        return "⚪ Станция EcoFlow не на связи"
+
+    soc = _fmt_soc(ef["soc"])
+    load = ef["pow_out_sum"]
+    if ef["mode"] == "grid":
+        parts = [f"🔌 Сеть есть · 🔋 {soc}"]
+        chg = ef["chg_rem_min"]
+        if ef["pow_in_sum"] > 15 and 0 < chg < 5900 and ef["soc"] < ef["max_chg_soc"]:
+            h, m = divmod(chg, 60)
+            parts.append(f"заряд еще {h} ч {m} мин" if h else f"заряд еще {m} мин")
+        if load > 0:
+            parts.append(f"нагрузка {load} Вт")
+        return " · ".join(parts)
+
+    rem = format_duration_minutes(ef["dsg_rem_min"], calculated_fallback=ef["calculated_rem_min"])
+    line2 = f"🔋 <b>{soc}</b> · " + (f"{load} Вт · хватит на <b>{rem}</b>" if load > 0 else "нагрузки нет")
+    if ef["pv_watts"] > 0:
+        line2 += f" · ☀️ {ef['pv_watts']} Вт"
+    return "🪫 <b>Света нет — работаем от станции</b>\n" + line2
+
+
+async def build_status_report() -> str:
+    """Короткий отчет: станция EcoFlow + график ДТЭК."""
+    async with aiohttp.ClientSession() as session:
+        dtek_task = asyncio.create_task(fetch_dtek_dnipro_schedule(session, DTEK_REGION, DTEK_GROUP))
+        ecoflow_task = asyncio.create_task(fetch_delta_pro_3_status(session))
         try:
             dtek_section = await dtek_task
         except Exception as exc:
             logger.exception("Ошибка получения графика ДТЭК")
-            dtek_section = (
-                f"⚠️ <b>График ДТЭК (Днепр, группа {DTEK_GROUP}):</b> не удалось загрузить ({html.escape(str(exc) or exc.__class__.__name__)})"
-            )
-
+            dtek_section = f"⚠️ График ДТЭК не загрузился ({html.escape(str(exc) or exc.__class__.__name__)})"
         try:
             ef = await ecoflow_task
         except Exception as exc:
             logger.exception("Ошибка получения данных EcoFlow DELTA Pro 3")
             ef = {"error": str(exc) or exc.__class__.__name__}
 
-    ef_lines: List[str] = ["🔋 <b>Станция EcoFlow DELTA Pro 3</b>"]
-
-    if "error" in ef:
-        ef_lines.append(f"⚠️ Ошибка связи с EcoFlow API: <code>{html.escape(ef['error'])}</code>")
-    elif not ef.get("online"):
-        ef_lines.append("⚪ Статус: <b>Офлайн</b> (нет актуальных данных от облака EcoFlow)")
-    else:
-        mode = ef["mode"]
-        soc = ef["soc"]
-        pow_in = ef["pow_in_sum"]
-        pow_out = ef["pow_out_sum"]
-
-        if mode == "grid":
-            # Режим работы от сети
-            ef_lines.append("🔌 Режим работы: <b>Сеть (байпас / зарядка от сети)</b>")
-            ef_lines.append(
-                f"⚡ Заряд батареи: <b>{soc}%</b> "
-                f"(вход: <b>{pow_in} Вт</b>, нагрузка: <b>{pow_out} Вт</b>)"
-            )
-            if ef["chg_rem_min"] > 0 and ef["chg_rem_min"] < 5900 and soc < ef["max_chg_soc"]:
-                h, m = divmod(ef["chg_rem_min"], 60)
-                chg_str = f"~{h} ч {m} мин" if h else f"~{m} мин"
-                ef_lines.append(f"⏳ До полного заряда ({ef['max_chg_soc']}%): <b>{chg_str}</b>")
-        else:
-            # Режим работы от станции (питание от батареи EcoFlow DELTA Pro 3)
-            ef_lines.append("🪫 Режим работы: <b>Станция (питание от EcoFlow DELTA Pro 3)</b>")
-
-            # 1. Основные параметры заряда
-            charge_details = f"<b>{soc}%</b> (~{ef['remaining_wh']} Вт·ч доступно)"
-            ef_lines.append(f"📊 Уровень заряда: {charge_details}")
-
-            limits_parts = [f"лимит разряда: {ef['min_dsg_soc']}%"]
-            if ef.get("backup_reserve_soc") is not None:
-                limits_parts.append(f"резерв: {ef['backup_reserve_soc']}%")
-            if ef.get("soh") is not None:
-                limits_parts.append(f"SoH: {ef['soh']}%")
-            ef_lines.append(f"⚙️ Параметры батареи: {', '.join(limits_parts)}")
-
-            if ef.get("temp_min") is not None and ef.get("temp_max") is not None:
-                if ef["temp_min"] == ef["temp_max"]:
-                    ef_lines.append(f"🌡 Температура ячеек: <b>{ef['temp_min']} °C</b>")
-                else:
-                    ef_lines.append(
-                        f"🌡 Температура ячеек: <b>{ef['temp_min']}…{ef['temp_max']} °C</b>"
-                    )
-
-            # 2. Примерное время до полного разряда
-            rem_str = format_duration_minutes(
-                ef["dsg_rem_min"], calculated_fallback=ef["calculated_rem_min"]
-            )
-            ef_lines.append(f"⏳ Время до полного разряда: <b>{rem_str}</b>")
-
-            # 3. Текущая потребляемая мощность
-            port_breakdown: List[str] = []
-            if ef["ac_out_watts"] > 0:
-                port_breakdown.append(f"AC: {ef['ac_out_watts']} Вт")
-            if ef["dc_12v_watts"] > 0:
-                port_breakdown.append(f"DC 12V: {ef['dc_12v_watts']} Вт")
-            breakdown_str = f" ({', '.join(port_breakdown)})" if port_breakdown else ""
-            ef_lines.append(f"💡 Текущая потребляемая мощность: <b>{pow_out} Вт</b>{breakdown_str}")
-
-            if ef["pv_watts"] > 0:
-                ef_lines.append(f"☀️ Солнечный вход (PV): <b>{ef['pv_watts']} Вт</b>")
-
-    now_str = datetime.datetime.now(KYIV_TZ).strftime("%d.%m.%Y %H:%M")
-    return f"🕒 <b>Статус на {now_str} (Днепр)</b>\n\n" + "\n".join(ef_lines) + "\n\n" + dtek_section
+    now_str = datetime.datetime.now(KYIV_TZ).strftime("%d.%m %H:%M")
+    return f"🕒 {now_str}\n{format_ecoflow_section(ef)}\n\n{dtek_section}"
 
 
 # =====================================================================
@@ -986,19 +947,21 @@ async def monitor_loop(bot: Optional[Bot]) -> None:
                         mode = ef["mode"]
                         now_str = datetime.datetime.now(KYIV_TZ).strftime("%H:%M")
                         if last_mode is not None and mode != last_mode:
+                            logger.info(
+                                "Смена режима: %s → %s (flowInfoAcIn=%s, AC in=%s Вт)",
+                                last_mode, mode, ef.get("flow_ac_in"), ef.get("ac_in_watts"),
+                            )
                             if mode == "station":
                                 rem = format_duration_minutes(ef["dsg_rem_min"], ef["calculated_rem_min"])
+                                tail = f" · хватит на <b>{rem}</b>" if ef["pow_out_sum"] > 0 else ""
                                 await _notify(
                                     bot,
-                                    f"🔴 <b>{now_str} — свет пропал.</b> Работаем от EcoFlow.\n"
-                                    f"📊 Заряд: <b>{ef['soc']}%</b>, нагрузка: <b>{ef['pow_out_sum']} Вт</b>\n"
-                                    f"⏳ Хватит примерно на: <b>{rem}</b>",
+                                    f"🔴 <b>{now_str} свет пропал</b>\n"
+                                    f"🔋 {_fmt_soc(ef['soc'])} · {ef['pow_out_sum']} Вт{tail}",
                                 )
                             else:
                                 await _notify(
-                                    bot,
-                                    f"🟢 <b>{now_str} — свет появился.</b> "
-                                    f"Станция заряжается, заряд: <b>{ef['soc']}%</b>",
+                                    bot, f"🟢 <b>{now_str} свет появился</b> · 🔋 {_fmt_soc(ef['soc'])}"
                                 )
                         last_mode = mode
 
@@ -1006,8 +969,7 @@ async def monitor_loop(bot: Optional[Bot]) -> None:
                             rem = format_duration_minutes(ef["dsg_rem_min"], ef["calculated_rem_min"])
                             await _notify(
                                 bot,
-                                f"🪫 <b>Низкий заряд EcoFlow: {ef['soc']}%</b>\n"
-                                f"⏳ Осталось примерно: <b>{rem}</b>",
+                                f"🪫 <b>Низкий заряд: {_fmt_soc(ef['soc'])}</b> · осталось {rem}",
                             )
                             low_battery_sent = True
                         elif ef["soc"] > LOW_BATTERY_SOC + 5 or mode == "grid":
@@ -1023,7 +985,7 @@ async def monitor_loop(bot: Optional[Bot]) -> None:
                     if fp is not None:
                         if last_schedule is not None and fp != last_schedule:
                             schedule_text = await fetch_dtek_dnipro_schedule(session)
-                            await _notify(bot, "🔔 <b>ДТЭК обновил график!</b>\n\n" + schedule_text)
+                            await _notify(bot, "🔔 <b>ДТЭК обновил график</b>\n" + schedule_text)
                         last_schedule = fp
         except asyncio.CancelledError:
             raise
