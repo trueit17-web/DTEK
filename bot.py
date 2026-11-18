@@ -237,7 +237,7 @@ async def fetch_delta_pro_3_status(session: aiohttp.ClientSession) -> Dict[str, 
     ac_out_watts = abs(
         _get_quota_float(q, ["powGetAc", "powGetAcLvOut", "powGetAcHvOut"], 0.0) or 0.0
     )
-    dc_12v_watts = abs(_get_quota_float(q, ["powGet_12v", "carWatts"], 0.0) or 0.0)
+    dc_12v_watts = abs(_get_quota_float(q, ["powGet12v", "powGet_12v", "carWatts"], 0.0) or 0.0)
     pv_watts = (
         abs(_get_quota_float(q, ["powGetPv", "powGetPvH"], 0.0) or 0.0)
         + abs(_get_quota_float(q, ["powGetPv2", "powGetPvL"], 0.0) or 0.0)
