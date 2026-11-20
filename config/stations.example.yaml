@@ -1,0 +1,36 @@
+# Станции EcoFlow. Скопируйте файл в config/stations.yaml и заполните.
+# Бот перечитывает файл сам — после правки перезапуск не нужен.
+#
+# Поля станции:
+#   name            — как станция подписана в отчетах и уведомлениях
+#   access_key,
+#   secret_key      — ключи с developer-eu.ecoflow.com того аккаунта, где станция в приложении
+#   sn              — серийный номер станции
+#   api_host        — https://api-e.ecoflow.com (Европа, по умолчанию) или https://api-a.ecoflow.com (США)
+#   telegram_ids    — кому в Telegram слать уведомления; эти люди также видят станцию по «статус»
+#                     (свой ID человек узнает командой /id в боте)
+#   whatsapp_chats  — группы WhatsApp для уведомлений (ID группы: написать «id» в группе)
+#   dtek            — true: показывать график ДТЭК и слать его изменения; false: только статус станции
+#   dtek_region     — регион в данных ДТЭК (dnipro, kyiv, odesa ...), по умолчанию dnipro
+#   dtek_group      — группа отключений, например "3.1"
+#   low_battery_soc — порог уведомления о низком заряде, % (по умолчанию 20)
+#   capacity_wh     — емкость, если станция ее не сообщает (по умолчанию 4096)
+#
+# Администраторы из ALLOWED_USER_IDS (.env) видят все станции и команду /stations.
+
+stations:
+  - name: Дом
+    access_key: "ВАШ_ACCESS_KEY"
+    secret_key: "ВАШ_SECRET_KEY"
+    sn: "MR51XXXXXXXXXXXX"
+    telegram_ids: [123456789]
+    whatsapp_chats: ["120363000000000000@g.us"]
+    dtek: true
+    dtek_group: "3.1"
+
+  - name: Дача
+    access_key: "ДРУГОЙ_ACCESS_KEY"
+    secret_key: "ДРУГОЙ_SECRET_KEY"
+    sn: "MR51YYYYYYYYYYYY"
+    telegram_ids: [987654321]
+    dtek: false          # только статус станции, без графика ДТЭК

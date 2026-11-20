@@ -1,20 +1,11 @@
 #!/usr/bin/env python3
 """
-Telegram-бот для мониторинга графика отключений ДТЭК (г. Днепр, группа 3.1)
-и состояния зарядной станции EcoFlow DELTA Pro 3.
+Бот для Telegram и WhatsApp: статус станций EcoFlow (DELTA Pro 3) и график отключений ДТЭК.
 
-По текстовому сообщению «статус» (или команде /status) бот сообщает:
-1. Актуальный график отключений ДТЭК Днепровские электросети для группы 3.1
-   на сегодня и завтра, а также текущий статус по графику (есть свет или отключение).
-2. Режим работы станции EcoFlow DELTA Pro 3: «Сеть (байпас / зарядка)» или «Станция (от батареи)».
-3. Если текущий режим работы — от станции EcoFlow DELTA Pro 3:
-   - Основные параметры заряда: уровень заряда (SoC, %), доступный запас энергии (Вт·ч),
-     лимит разряда (нижний порог SoC), здоровье АКБ (SoH, %) и температура ячеек (°C)
-   - Примерное время до полного разряда (ч и мин)
-   - Текущую потребляемую мощность нагрузки (общая в Вт + разбивка AC / DC)
-
-Все настройки задаются переменными окружения (см. .env.example).
-Запуск на сервере: см. README.md (docker compose up -d --build).
+Поддерживает несколько станций с разных аккаунтов EcoFlow. Станции описываются в файле
+config/stations.yaml (пример — config/stations.example.yaml): у каждой свои ключи EcoFlow,
+свои получатели уведомлений в Telegram/WhatsApp и своя настройка графика ДТЭК.
+Если файла нет, используется одна станция из переменных окружения (.env).
 """
 
 import asyncio
@@ -29,6 +20,7 @@ import random
 import re
 import sys
 import time
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 from zoneinfo import ZoneInfo
 
@@ -37,6 +29,7 @@ from aiogram import Bot, Dispatcher, F, types
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiohttp import web
+import yaml
 
 # =====================================================================
 # КОНФИГУРАЦИЯ (Днепр, группа 3.1 + EcoFlow DELTA Pro 3)
@@ -49,6 +42,7 @@ ALLOWED_USER_IDS: Set[int] = {
     int(x) for x in os.getenv("ALLOWED_USER_IDS", "").replace(" ", "").split(",") if x.isdigit()
 }
 
+# --- Станция по умолчанию из .env (используется, если нет config/stations.yaml) ---
 # Ключи EcoFlow Developer Platform (https://developer-eu.ecoflow.com/)
 ECOFLOW_ACCESS_KEY = os.getenv("ECOFLOW_ACCESS_KEY", "YOUR_ECOFLOW_ACCESS_KEY")
 ECOFLOW_SECRET_KEY = os.getenv("ECOFLOW_SECRET_KEY", "YOUR_ECOFLOW_SECRET_KEY")
@@ -61,7 +55,8 @@ DELTA_PRO_3_CAPACITY_WH = float(os.getenv("DELTA_PRO_3_CAPACITY_WH", "4096"))
 
 # Настройки ДТЭК Днепровские электросети — г. Днепр, группа 3.1
 DTEK_REGION = os.getenv("DTEK_REGION", "dnipro")
-DTEK_CITY_TITLE = "г. Днепр (ДТЭК Днепровские электросети)"
+DTEK_ENABLED = os.getenv("DTEK_ENABLED", "1").lower() in ("1", "true", "yes", "on")
+STATIONS_FILE = os.getenv("STATIONS_FILE", "/app/config/stations.yaml")
 DTEK_GROUP = os.getenv("DTEK_GROUP", "3.1")
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
@@ -87,6 +82,126 @@ WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8080"))
 
 STATUS_WORDS = {"статус", "status", "свет", "график", "экофлоу", "/status"}
 
+
+@dataclass
+class Station:
+    """Станция EcoFlow со своими ключами, получателями уведомлений и настройкой ДТЭК."""
+    name: str
+    access_key: str
+    secret_key: str
+    sn: str
+    api_host: str = "https://api-e.ecoflow.com"
+    capacity_wh: float = 4096.0
+    telegram_ids: Set[int] = field(default_factory=set)
+    whatsapp_chats: List[str] = field(default_factory=list)
+    dtek: bool = True
+    dtek_region: str = "dnipro"
+    dtek_group: str = "3.1"
+    low_battery_soc: float = 20.0
+
+    @property
+    def key(self) -> str:
+        return self.sn or self.name
+
+
+def _as_bool(v: Any, default: bool = True) -> bool:
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in ("1", "true", "yes", "on", "да")
+
+
+def _station_from_env() -> Station:
+    return Station(
+        name="EcoFlow",
+        access_key=ECOFLOW_ACCESS_KEY,
+        secret_key=ECOFLOW_SECRET_KEY,
+        sn=ECOFLOW_DEVICE_SN,
+        api_host=ECOFLOW_API_HOST,
+        capacity_wh=DELTA_PRO_3_CAPACITY_WH,
+        telegram_ids=set(NOTIFY_CHAT_IDS),
+        whatsapp_chats=list(WHATSAPP_CHAT_IDS),
+        dtek=DTEK_ENABLED,
+        dtek_region=DTEK_REGION,
+        dtek_group=DTEK_GROUP,
+        low_battery_soc=LOW_BATTERY_SOC,
+    )
+
+
+def _parse_stations(raw: Any) -> List[Station]:
+    items = (raw or {}).get("stations") if isinstance(raw, dict) else raw
+    if not isinstance(items, list) or not items:
+        raise ValueError("в файле нет списка stations")
+    result: List[Station] = []
+    for i, it in enumerate(items, 1):
+        if not isinstance(it, dict):
+            raise ValueError(f"станция №{i}: ожидается набор полей")
+        missing = [k for k in ("access_key", "secret_key", "sn") if not str(it.get(k) or "").strip()]
+        if missing:
+            raise ValueError(f"станция №{i}: не заполнено {', '.join(missing)}")
+        tg = it.get("telegram_ids") or []
+        wa = it.get("whatsapp_chats") or []
+        result.append(Station(
+            name=str(it.get("name") or f"Станция {i}"),
+            access_key=str(it["access_key"]).strip(),
+            secret_key=str(it["secret_key"]).strip(),
+            sn=str(it["sn"]).strip(),
+            api_host=str(it.get("api_host") or "https://api-e.ecoflow.com").rstrip("/"),
+            capacity_wh=float(it.get("capacity_wh") or 4096),
+            telegram_ids={int(x) for x in (tg if isinstance(tg, list) else [tg])},
+            whatsapp_chats=[str(x).strip() for x in (wa if isinstance(wa, list) else [wa])],
+            dtek=_as_bool(it.get("dtek"), True),
+            dtek_region=str(it.get("dtek_region") or "dnipro"),
+            dtek_group=str(it.get("dtek_group") or "3.1"),
+            low_battery_soc=float(it.get("low_battery_soc") or 20),
+        ))
+    return result
+
+
+_stations_cache: Tuple[Optional[float], List[Station]] = (None, [])
+
+
+def get_stations() -> List[Station]:
+    """
+    Список станций. Файл config/stations.yaml перечитывается при изменении —
+    станции можно добавлять без перезапуска бота.
+    """
+    global _stations_cache
+    try:
+        mtime = os.path.getmtime(STATIONS_FILE)
+    except OSError:
+        return [_station_from_env()]
+    if _stations_cache[0] == mtime:
+        return _stations_cache[1]
+    try:
+        with open(STATIONS_FILE, encoding="utf-8") as f:
+            stations = _parse_stations(yaml.safe_load(f))
+        logger.info("Загружено станций: %s (%s)", len(stations), ", ".join(s.name for s in stations))
+    except Exception as exc:
+        logger.error("Ошибка в %s: %s — оставляю прежний список станций", STATIONS_FILE, exc)
+        if _stations_cache[1]:
+            return _stations_cache[1]
+        stations = [_station_from_env()]
+    _stations_cache = (mtime, stations)
+    return stations
+
+
+def is_admin(user_id: Optional[int]) -> bool:
+    return user_id is not None and (not ALLOWED_USER_IDS or user_id in ALLOWED_USER_IDS)
+
+
+def stations_for_telegram(user_id: Optional[int]) -> List[Station]:
+    """Админы (ALLOWED_USER_IDS) видят все станции, остальные — только свои."""
+    stations = get_stations()
+    if is_admin(user_id):
+        return stations
+    return [s for s in stations if user_id in s.telegram_ids]
+
+
+def stations_for_whatsapp(chat_id: str) -> List[Station]:
+    return [s for s in get_stations() if chat_id in s.whatsapp_chats]
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -94,7 +209,7 @@ logger = logging.getLogger(__name__)
 # =====================================================================
 # 1. КЛИЕНТ ECOFLOW DELTA PRO 3 (Developer API / Quota All)
 # =====================================================================
-def _generate_ecoflow_headers(params: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+def _generate_ecoflow_headers(st: Station, params: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
     """
     Формирует заголовки HMAC-SHA256 для EcoFlow Quota API (GET /iot-open/sign/device/quota/all).
     Документация: https://developer-eu.ecoflow.com/
@@ -108,17 +223,17 @@ def _generate_ecoflow_headers(params: Optional[Dict[str, Any]] = None) -> Dict[s
             query_parts.append(f"{key}={params[key]}")
 
     query_str = "&".join(query_parts)
-    auth_str = f"accessKey={ECOFLOW_ACCESS_KEY}&nonce={nonce}&timestamp={timestamp}"
+    auth_str = f"accessKey={st.access_key}&nonce={nonce}&timestamp={timestamp}"
     sign_str = f"{query_str}&{auth_str}" if query_str else auth_str
 
     signature = hmac.new(
-        ECOFLOW_SECRET_KEY.encode("utf-8"),
+        st.secret_key.encode("utf-8"),
         sign_str.encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
 
     return {
-        "accessKey": ECOFLOW_ACCESS_KEY,
+        "accessKey": st.access_key,
         "nonce": nonce,
         "timestamp": timestamp,
         "sign": signature,
@@ -152,17 +267,17 @@ def _get_quota_float(data: Dict[str, Any], keys: List[str], default: Optional[fl
     return default
 
 
-async def fetch_device_online(session: aiohttp.ClientSession) -> Optional[bool]:
+async def fetch_device_online(session: aiohttp.ClientSession, st: Station) -> Optional[bool]:
     """
     Проверяет через GET /iot-open/sign/device/list, в сети ли станция.
     Квоты (quota/all) отдаются облаком даже для офлайн-устройства (последние известные значения),
     поэтому без этой проверки бот показывал бы устаревшие данные как актуальные.
     Возвращает None, если узнать не удалось.
     """
-    url = f"{ECOFLOW_API_HOST}/iot-open/sign/device/list"
+    url = f"{st.api_host}/iot-open/sign/device/list"
     try:
         async with session.get(
-            url, headers=_generate_ecoflow_headers(), timeout=aiohttp.ClientTimeout(total=10)
+            url, headers=_generate_ecoflow_headers(st), timeout=aiohttp.ClientTimeout(total=10)
         ) as resp:
             payload = await resp.json(content_type=None)
     except Exception:
@@ -171,12 +286,12 @@ async def fetch_device_online(session: aiohttp.ClientSession) -> Optional[bool]:
     if str(payload.get("code")) != "0":
         return None
     for dev in payload.get("data") or []:
-        if str(dev.get("sn")) == ECOFLOW_DEVICE_SN:
+        if str(dev.get("sn")) == st.sn:
             return str(dev.get("online")) == "1"
     return None
 
 
-async def fetch_delta_pro_3_status(session: aiohttp.ClientSession) -> Dict[str, Any]:
+async def fetch_delta_pro_3_status(session: aiohttp.ClientSession, st: Station) -> Dict[str, Any]:
     """
     Опрашивает станцию EcoFlow DELTA Pro 3 через GET /iot-open/sign/device/quota/all
     и извлекает телеметрию:
@@ -194,9 +309,9 @@ async def fetch_delta_pro_3_status(session: aiohttp.ClientSession) -> Dict[str, 
       - cmsMinDsgSoc: установленный лимит разряда (%)
       - bmsMinCellTemp / bmsMaxCellTemp: температура ячеек АКБ (°C)
     """
-    url = f"{ECOFLOW_API_HOST}/iot-open/sign/device/quota/all"
-    params = {"sn": ECOFLOW_DEVICE_SN}
-    headers = _generate_ecoflow_headers(params)
+    url = f"{st.api_host}/iot-open/sign/device/quota/all"
+    params = {"sn": st.sn}
+    headers = _generate_ecoflow_headers(st, params)
 
     async with session.get(
         url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=12)
@@ -216,7 +331,7 @@ async def fetch_delta_pro_3_status(session: aiohttp.ClientSession) -> Dict[str, 
         )
 
     q: Dict[str, Any] = payload.get("data") or {}
-    if not q or await fetch_device_online(session) is False:
+    if not q or await fetch_device_online(session, st) is False:
         return {"online": False}
 
     # Основные параметры заряда DELTA Pro 3
@@ -279,7 +394,7 @@ async def fetch_delta_pro_3_status(session: aiohttp.ClientSession) -> Dict[str, 
 
     # Расчет доступного запаса энергии (Вт·ч) с учетом нижнего порога разряда cmsMinDsgSoc
     usable_soc_pct = max(0.0, soc - min_dsg_soc)
-    capacity_wh = _get_quota_float(q, ["cmsBattFullEnergy"], None) or DELTA_PRO_3_CAPACITY_WH
+    capacity_wh = _get_quota_float(q, ["cmsBattFullEnergy"], None) or st.capacity_wh
     remaining_wh = int(round((usable_soc_pct / 100.0) * capacity_wh))
 
     # Если станция отдает нагрузку, а cmsDsgRemTime равен 0 или техническому максимуму (5999 / 15999),
@@ -519,24 +634,47 @@ def format_ecoflow_section(ef: Dict[str, Any]) -> str:
     return "🪫 <b>Света нет — работаем от станции</b>\n" + line2
 
 
-async def build_status_report() -> str:
-    """Короткий отчет: станция EcoFlow + график ДТЭК."""
+async def _safe_station_status(session: aiohttp.ClientSession, st: Station) -> Dict[str, Any]:
+    try:
+        return await fetch_delta_pro_3_status(session, st)
+    except Exception as exc:
+        logger.warning("EcoFlow «%s»: %s", st.name, exc)
+        return {"error": str(exc) or exc.__class__.__name__}
+
+
+async def _safe_schedule(session: aiohttp.ClientSession, region: str, group: str) -> str:
+    try:
+        return await fetch_dtek_dnipro_schedule(session, region, group)
+    except Exception as exc:
+        logger.warning("ДТЭК %s/%s: %s", region, group, exc)
+        return f"⚠️ График ДТЭК ({group}) не загрузился ({html.escape(str(exc) or exc.__class__.__name__)})"
+
+
+async def build_status_report(stations: Optional[List[Station]] = None) -> str:
+    """Короткий отчет по станциям и графикам ДТЭК (только для станций с dtek: true)."""
+    stations = get_stations() if stations is None else stations
+    if not stations:
+        return "У вас нет станций. Попросите администратора добавить ваш Telegram ID к станции (ID: /id)."
+    groups: List[Tuple[str, str]] = []
+    for st in stations:
+        if st.dtek and (st.dtek_region, st.dtek_group) not in groups:
+            groups.append((st.dtek_region, st.dtek_group))
+
     async with aiohttp.ClientSession() as session:
-        dtek_task = asyncio.create_task(fetch_dtek_dnipro_schedule(session, DTEK_REGION, DTEK_GROUP))
-        ecoflow_task = asyncio.create_task(fetch_delta_pro_3_status(session))
-        try:
-            dtek_section = await dtek_task
-        except Exception as exc:
-            logger.exception("Ошибка получения графика ДТЭК")
-            dtek_section = f"⚠️ График ДТЭК не загрузился ({html.escape(str(exc) or exc.__class__.__name__)})"
-        try:
-            ef = await ecoflow_task
-        except Exception as exc:
-            logger.exception("Ошибка получения данных EcoFlow DELTA Pro 3")
-            ef = {"error": str(exc) or exc.__class__.__name__}
+        ef_list, schedules = await asyncio.gather(
+            asyncio.gather(*(_safe_station_status(session, st) for st in stations)),
+            asyncio.gather(*(_safe_schedule(session, r, g) for r, g in groups)),
+        )
 
     now_str = datetime.datetime.now(KYIV_TZ).strftime("%d.%m %H:%M")
-    return f"🕒 {now_str}\n{format_ecoflow_section(ef)}\n\n{dtek_section}"
+    blocks = []
+    for st, ef in zip(stations, ef_list):
+        section = format_ecoflow_section(ef)
+        blocks.append(f"<b>{html.escape(st.name)}</b>\n{section}" if len(stations) > 1 else section)
+    text = f"🕒 {now_str}\n" + "\n\n".join(blocks)
+    if schedules:
+        text += "\n\n" + "\n\n".join(schedules)
+    return text
 
 
 # =====================================================================
@@ -691,11 +829,12 @@ async def _wa_handle_message(payload: Dict[str, Any]) -> None:
         return
 
     if body in STATUS_WORDS:
-        if WHATSAPP_CHAT_IDS and chat_id not in WHATSAPP_CHAT_IDS:
+        stations = stations_for_whatsapp(chat_id)
+        if not stations:
             logger.info("WhatsApp: запрос статуса из чужого чата %s — игнорирую", chat_id)
             return
         try:
-            report = await build_status_report()
+            report = await build_status_report(stations)
         except Exception as exc:
             logger.exception("Ошибка формирования отчета для WhatsApp")
             report = f"⚠️ Не удалось сформировать отчет: {html.escape(str(exc))}"
@@ -724,12 +863,12 @@ async def waha_webhook(request: web.Request) -> web.Response:
         bot: Optional[Bot] = request.app.get("bot")
         if _wa_last_status == "WORKING" and status in ("SCAN_QR_CODE", "FAILED", "STOPPED"):
             await _notify_telegram(
-                bot,
+                bot, ALLOWED_USER_IDS,
                 f"⚠️ WhatsApp отключился (статус {status}). "
                 "Подключите заново: /wa_code НОМЕР (или /wa_qr), либо на сервере ./wa-link.sh",
             )
         elif status == "WORKING" and _wa_last_status not in (None, "WORKING"):
-            await _notify_telegram(bot, "✅ WhatsApp подключен.")
+            await _notify_telegram(bot, ALLOWED_USER_IDS, "✅ WhatsApp подключен.")
         _wa_last_status = status
 
     return web.Response(text="ok")
@@ -760,11 +899,13 @@ async def start_webhook_server(bot: Optional[Bot]) -> web.AppRunner:
 dp = Dispatcher()
 
 
+def _uid(message: types.Message) -> Optional[int]:
+    return message.from_user.id if message.from_user else None
+
+
 def _is_allowed(message: types.Message) -> bool:
-    """Если задан ALLOWED_USER_IDS, пропускает только перечисленных пользователей."""
-    if not ALLOWED_USER_IDS:
-        return True
-    return bool(message.from_user and message.from_user.id in ALLOWED_USER_IDS)
+    """Доступ есть у админов (ALLOWED_USER_IDS) и у получателей хотя бы одной станции."""
+    return bool(stations_for_telegram(_uid(message)))
 
 
 @dp.message(Command("id"))
@@ -840,8 +981,27 @@ async def cmd_wa_status(message: types.Message) -> None:
         status = await wa_session_status()
     except Exception as exc:
         status = f"нет связи со шлюзом: {_wa_error_text(exc)}"
-    chats = ", ".join(WHATSAPP_CHAT_IDS) or "не заданы (WHATSAPP_CHAT_IDS)"
-    await message.answer(f"WhatsApp: {status}\nГруппы для уведомлений: {chats}")
+    chats = sorted({c for s in get_stations() for c in s.whatsapp_chats})
+    await message.answer(f"WhatsApp: {status}\nГруппы для уведомлений: {', '.join(chats) or 'не заданы'}")
+
+
+@dp.message(Command("stations"))
+async def cmd_stations(message: types.Message) -> None:
+    """Список станций и их получателей (только для админов)."""
+    if not ALLOWED_USER_IDS or not is_admin(_uid(message)):
+        await message.answer("⛔ Команда доступна только администраторам (ALLOWED_USER_IDS).")
+        return
+    lines = []
+    for i, st in enumerate(get_stations(), 1):
+        lines.append(
+            f"{i}. <b>{html.escape(st.name)}</b> · SN …{html.escape(st.sn[-4:])}\n"
+            f"   Telegram: {', '.join(map(str, sorted(st.telegram_ids))) or '—'}\n"
+            f"   WhatsApp: {', '.join(st.whatsapp_chats) or '—'}\n"
+            f"   ДТЭК: {('группа ' + st.dtek_group) if st.dtek else 'выключен'}"
+        )
+    src = STATIONS_FILE if os.path.exists(STATIONS_FILE) else ".env (файла stations.yaml нет)"
+    await message.answer("\n".join(lines) + f"\n\nНастройки: <code>{html.escape(src)}</code>",
+                         parse_mode=ParseMode.HTML)
 
 
 @dp.message(Command("start", "help"))
@@ -855,9 +1015,8 @@ async def cmd_start(message: types.Message) -> None:
         resize_keyboard=True,
     )
     await message.answer(
-        "Привет! Отправьте <b>статус</b> (или нажмите кнопку ниже), чтобы получить "
-        f"график отключений ДТЭК (г. Днепр, группа {DTEK_GROUP}) и параметры вашей станции "
-        "<b>EcoFlow DELTA Pro 3</b>.",
+        "Привет! Отправьте <b>статус</b> (или нажмите кнопку ниже), чтобы узнать состояние "
+        "станции EcoFlow и график отключений ДТЭК.",
         parse_mode=ParseMode.HTML,
         reply_markup=kb,
     )
@@ -870,11 +1029,9 @@ async def handle_status(message: types.Message) -> None:
     if not _is_allowed(message):
         await message.answer("⛔ Доступ к боту закрыт. Узнать свой ID: /id")
         return
-    wait_msg = await message.answer(
-        f"⏳ Опрашиваю EcoFlow DELTA Pro 3 и график ДТЭК (группа {DTEK_GROUP})..."
-    )
+    wait_msg = await message.answer("⏳ Опрашиваю станцию...")
     try:
-        report = await build_status_report()
+        report = await build_status_report(stations_for_telegram(_uid(message)))
     except Exception as exc:
         logger.exception("Ошибка формирования отчета")
         report = f"⚠️ Не удалось сформировать отчет: <code>{html.escape(str(exc))}</code>"
@@ -884,109 +1041,117 @@ async def handle_status(message: types.Message) -> None:
 # =====================================================================
 # 5. ФОНОВЫЙ МОНИТОРИНГ И УВЕДОМЛЕНИЯ
 # =====================================================================
-async def _notify_telegram(bot: Optional[Bot], text: str) -> None:
+async def _notify_telegram(bot: Optional[Bot], chat_ids: Any, text: str) -> None:
     if bot is None:
         return
-    for chat_id in NOTIFY_CHAT_IDS:
+    for chat_id in chat_ids:
         try:
             await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
         except Exception:
             logger.warning("Не удалось отправить уведомление в чат %s", chat_id, exc_info=True)
 
 
-async def _notify(bot: Optional[Bot], text: str) -> None:
-    """Рассылает уведомление в Telegram и в группы WhatsApp."""
-    await _notify_telegram(bot, text)
+async def _notify(bot: Optional[Bot], tg_ids: Any, wa_chats: Any, text: str) -> None:
+    """Рассылает уведомление в указанные чаты Telegram и группы WhatsApp."""
+    await _notify_telegram(bot, tg_ids, text)
     if WHATSAPP_ENABLED:
-        for chat_id in WHATSAPP_CHAT_IDS:
+        for chat_id in wa_chats:
             try:
                 await wa_send(chat_id, text)
             except Exception:
                 logger.warning("Не удалось отправить уведомление в WhatsApp %s", chat_id, exc_info=True)
 
 
+@dataclass
+class _StationState:
+    mode: Optional[str] = None
+    online: Optional[bool] = None
+    low_sent: bool = False
+
+
+async def _check_station(bot: Optional[Bot], session: aiohttp.ClientSession, st: Station,
+                         state: _StationState, show_name: bool) -> None:
+    try:
+        ef = await fetch_delta_pro_3_status(session, st)
+    except Exception as exc:
+        logger.warning("Мониторинг «%s»: ошибка EcoFlow API: %s", st.name, exc)
+        return
+
+    async def send(text: str) -> None:
+        prefix = f"<b>{html.escape(st.name)}</b>: " if show_name else ""
+        await _notify(bot, st.telegram_ids, st.whatsapp_chats, prefix + text)
+
+    online = bool(ef.get("online"))
+    if state.online is not None and online != state.online:
+        await send("🟢 станция снова на связи" if online else "⚪ станция <b>пропала из сети</b>")
+    state.online = online
+    if not online:
+        return
+
+    mode = ef["mode"]
+    now_str = datetime.datetime.now(KYIV_TZ).strftime("%H:%M")
+    if state.mode is not None and mode != state.mode:
+        logger.info("«%s»: смена режима %s → %s (flowInfoAcIn=%s, AC in=%s Вт)",
+                    st.name, state.mode, mode, ef.get("flow_ac_in"), ef.get("ac_in_watts"))
+        if mode == "station":
+            rem = format_duration_minutes(ef["dsg_rem_min"], ef["calculated_rem_min"])
+            tail = f" · хватит на <b>{rem}</b>" if ef["pow_out_sum"] > 0 else ""
+            await send(f"🔴 <b>{now_str} свет пропал</b>\n🔋 {_fmt_soc(ef['soc'])} · {ef['pow_out_sum']} Вт{tail}")
+        else:
+            await send(f"🟢 <b>{now_str} свет появился</b> · 🔋 {_fmt_soc(ef['soc'])}")
+    state.mode = mode
+
+    if mode == "station" and ef["soc"] <= st.low_battery_soc and not state.low_sent:
+        rem = format_duration_minutes(ef["dsg_rem_min"], ef["calculated_rem_min"])
+        await send(f"🪫 <b>Низкий заряд: {_fmt_soc(ef['soc'])}</b> · осталось {rem}")
+        state.low_sent = True
+    elif ef["soc"] > st.low_battery_soc + 5 or mode == "grid":
+        state.low_sent = False
+
+
 async def monitor_loop(bot: Optional[Bot]) -> None:
     """
-    Раз в MONITOR_INTERVAL_SEC опрашивает станцию и график и присылает уведомления:
-      - пропал свет (станция перешла на батарею) / свет появился;
-      - заряд упал ниже LOW_BATTERY_SOC при работе от батареи;
+    Раз в MONITOR_INTERVAL_SEC опрашивает все станции и графики и шлет уведомления
+    получателям конкретной станции:
+      - пропал свет / свет появился;
+      - низкий заряд при работе от батареи;
       - станция пропала из сети EcoFlow / снова на связи;
-      - ДТЭК изменил график для группы.
+      - ДТЭК изменил график (только станциям с dtek: true).
     """
-    last_mode: Optional[str] = None
-    last_online: Optional[bool] = None
-    low_battery_sent = False
-    last_schedule: Optional[str] = None
-    logger.info(
-        "Мониторинг включен: интервал %s с, Telegram: %s, WhatsApp: %s",
-        MONITOR_INTERVAL_SEC, sorted(NOTIFY_CHAT_IDS) if bot else "-",
-        WHATSAPP_CHAT_IDS if WHATSAPP_ENABLED else "-",
-    )
+    states: Dict[str, _StationState] = {}
+    schedules: Dict[Tuple[str, str], str] = {}
+    logger.info("Мониторинг включен: интервал %s с", MONITOR_INTERVAL_SEC)
 
     while True:
         try:
+            stations = get_stations()
+            show_name = len(stations) > 1
             async with aiohttp.ClientSession() as session:
-                # --- EcoFlow ---
-                try:
-                    ef = await fetch_delta_pro_3_status(session)
-                except Exception:
-                    logger.warning("Мониторинг: ошибка EcoFlow API", exc_info=True)
-                    ef = None
+                await asyncio.gather(*(
+                    _check_station(bot, session, st, states.setdefault(st.key, _StationState()), show_name)
+                    for st in stations
+                ))
 
-                if ef is not None:
-                    online = bool(ef.get("online"))
-                    if last_online is not None and online != last_online:
-                        await _notify(
-                            bot,
-                            "🟢 Станция EcoFlow снова на связи" if online
-                            else "⚪ Станция EcoFlow <b>пропала из сети</b> (нет связи с облаком)",
-                        )
-                    last_online = online
-
-                    if online:
-                        mode = ef["mode"]
-                        now_str = datetime.datetime.now(KYIV_TZ).strftime("%H:%M")
-                        if last_mode is not None and mode != last_mode:
-                            logger.info(
-                                "Смена режима: %s → %s (flowInfoAcIn=%s, AC in=%s Вт)",
-                                last_mode, mode, ef.get("flow_ac_in"), ef.get("ac_in_watts"),
-                            )
-                            if mode == "station":
-                                rem = format_duration_minutes(ef["dsg_rem_min"], ef["calculated_rem_min"])
-                                tail = f" · хватит на <b>{rem}</b>" if ef["pow_out_sum"] > 0 else ""
-                                await _notify(
-                                    bot,
-                                    f"🔴 <b>{now_str} свет пропал</b>\n"
-                                    f"🔋 {_fmt_soc(ef['soc'])} · {ef['pow_out_sum']} Вт{tail}",
-                                )
-                            else:
-                                await _notify(
-                                    bot, f"🟢 <b>{now_str} свет появился</b> · 🔋 {_fmt_soc(ef['soc'])}"
-                                )
-                        last_mode = mode
-
-                        if mode == "station" and ef["soc"] <= LOW_BATTERY_SOC and not low_battery_sent:
-                            rem = format_duration_minutes(ef["dsg_rem_min"], ef["calculated_rem_min"])
-                            await _notify(
-                                bot,
-                                f"🪫 <b>Низкий заряд: {_fmt_soc(ef['soc'])}</b> · осталось {rem}",
-                            )
-                            low_battery_sent = True
-                        elif ef["soc"] > LOW_BATTERY_SOC + 5 or mode == "grid":
-                            low_battery_sent = False
-
-                # --- График ДТЭК ---
                 if NOTIFY_SCHEDULE_CHANGES:
-                    try:
-                        fp = await fetch_dtek_group_fingerprint(session)
-                    except Exception:
-                        logger.warning("Мониторинг: ошибка загрузки графика ДТЭК", exc_info=True)
-                        fp = None
-                    if fp is not None:
-                        if last_schedule is not None and fp != last_schedule:
-                            schedule_text = await fetch_dtek_dnipro_schedule(session)
-                            await _notify(bot, "🔔 <b>ДТЭК обновил график</b>\n" + schedule_text)
-                        last_schedule = fp
+                    groups: Dict[Tuple[str, str], List[Station]] = {}
+                    for st in stations:
+                        if st.dtek:
+                            groups.setdefault((st.dtek_region, st.dtek_group), []).append(st)
+                    for (region, group), sts in groups.items():
+                        try:
+                            fp = await fetch_dtek_group_fingerprint(session, region, group)
+                        except Exception:
+                            logger.warning("Мониторинг: ошибка графика ДТЭК %s", group, exc_info=True)
+                            continue
+                        if fp is None:
+                            continue
+                        prev = schedules.get((region, group))
+                        if prev is not None and fp != prev:
+                            text = "🔔 <b>ДТЭК обновил график</b>\n" + await fetch_dtek_dnipro_schedule(session, region, group)
+                            tg = {i for s in sts for i in s.telegram_ids}
+                            wa = {c for s in sts for c in s.whatsapp_chats}
+                            await _notify(bot, tg, wa, text)
+                        schedules[(region, group)] = fp
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1002,20 +1167,16 @@ async def main() -> None:
         raise SystemExit(1)
 
     bot = Bot(token=TELEGRAM_BOT_TOKEN) if has_telegram else None
+    stations = get_stations()
     logger.info(
-        "Бот запущен (Днепр, группа %s | EcoFlow DELTA Pro 3) | Telegram: %s | WhatsApp: %s",
-        DTEK_GROUP, "да" if bot else "нет", "да" if WHATSAPP_ENABLED else "нет",
+        "Бот запущен | станций: %s | Telegram: %s | WhatsApp: %s",
+        len(stations), "да" if bot else "нет", "да" if WHATSAPP_ENABLED else "нет",
     )
 
     if WHATSAPP_ENABLED:
         await start_webhook_server(bot)
-        if not WHATSAPP_CHAT_IDS:
-            logger.warning("WHATSAPP_CHAT_IDS не задан: напишите «id» в нужной группе WhatsApp и впишите ID в .env")
 
-    if (bot and NOTIFY_CHAT_IDS) or (WHATSAPP_ENABLED and WHATSAPP_CHAT_IDS):
-        asyncio.create_task(monitor_loop(bot))
-    else:
-        logger.info("Уведомления выключены: задайте ALLOWED_USER_IDS/NOTIFY_CHAT_IDS или WHATSAPP_CHAT_IDS")
+    asyncio.create_task(monitor_loop(bot))
 
     if bot:
         await dp.start_polling(bot)
