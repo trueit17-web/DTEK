@@ -94,6 +94,7 @@ class Station:
     capacity_wh: float = 4096.0
     telegram_ids: Set[int] = field(default_factory=set)
     whatsapp_chats: List[str] = field(default_factory=list)
+    whatsapp_notify: bool = True  # False — в WhatsApp не слать уведомления (ответ на «статус» остается)
     dtek: bool = True
     dtek_region: str = "dnipro"
     dtek_group: str = "3.1"
@@ -151,6 +152,7 @@ def _parse_stations(raw: Any) -> List[Station]:
             capacity_wh=float(it.get("capacity_wh") or 4096),
             telegram_ids={int(x) for x in (tg if isinstance(tg, list) else [tg])},
             whatsapp_chats=[str(x).strip() for x in (wa if isinstance(wa, list) else [wa])],
+            whatsapp_notify=_as_bool(it.get("whatsapp_notify"), True),
             dtek=_as_bool(it.get("dtek"), True),
             dtek_region=str(it.get("dtek_region") or "dnipro"),
             dtek_group=str(it.get("dtek_group") or "3.1"),
@@ -996,7 +998,8 @@ async def cmd_stations(message: types.Message) -> None:
         lines.append(
             f"{i}. <b>{html.escape(st.name)}</b> · SN …{html.escape(st.sn[-4:])}\n"
             f"   Telegram: {', '.join(map(str, sorted(st.telegram_ids))) or '—'}\n"
-            f"   WhatsApp: {', '.join(st.whatsapp_chats) or '—'}\n"
+            f"   WhatsApp: {', '.join(st.whatsapp_chats) or '—'}"
+            f"{'' if st.whatsapp_notify else ' (уведомления выключены)'}\n"
             f"   ДТЭК: {('группа ' + st.dtek_group) if st.dtek else 'выключен'}"
         )
     src = STATIONS_FILE if os.path.exists(STATIONS_FILE) else ".env (файла stations.yaml нет)"
@@ -1079,7 +1082,7 @@ async def _check_station(bot: Optional[Bot], session: aiohttp.ClientSession, st:
 
     async def send(text: str) -> None:
         prefix = f"<b>{html.escape(st.name)}</b>: " if show_name else ""
-        await _notify(bot, st.telegram_ids, st.whatsapp_chats, prefix + text)
+        await _notify(bot, st.telegram_ids, st.whatsapp_chats if st.whatsapp_notify else [], prefix + text)
 
     online = bool(ef.get("online"))
     if state.online is not None and online != state.online:
@@ -1149,7 +1152,7 @@ async def monitor_loop(bot: Optional[Bot]) -> None:
                         if prev is not None and fp != prev:
                             text = "🔔 <b>ДТЭК обновил график</b>\n" + await fetch_dtek_dnipro_schedule(session, region, group)
                             tg = {i for s in sts for i in s.telegram_ids}
-                            wa = {c for s in sts for c in s.whatsapp_chats}
+                            wa = {c for s in sts if s.whatsapp_notify for c in s.whatsapp_chats}
                             await _notify(bot, tg, wa, text)
                         schedules[(region, group)] = fp
         except asyncio.CancelledError:
