@@ -94,7 +94,9 @@ class Station:
     capacity_wh: float = 4096.0
     telegram_ids: Set[int] = field(default_factory=set)
     whatsapp_chats: List[str] = field(default_factory=list)
-    whatsapp_notify: bool = True  # False — в WhatsApp не слать уведомления (ответ на «статус» остается)
+    # Какие уведомления слать в WhatsApp: mode, low_battery, online, schedule (пусто — никакие;
+    # на «статус» бот отвечает всегда)
+    whatsapp_events: Set[str] = field(default_factory=lambda: set(WA_EVENTS))
     dtek: bool = True
     dtek_region: str = "dnipro"
     dtek_group: str = "3.1"
@@ -103,6 +105,26 @@ class Station:
     @property
     def key(self) -> str:
         return self.sn or self.name
+
+
+WA_EVENTS = ("mode", "low_battery", "online", "schedule")
+
+
+def _parse_wa_events(value: Any, i: int) -> Set[str]:
+    """whatsapp_notify: true/false или список событий, например [mode]."""
+    if value is None or value is True:
+        return set(WA_EVENTS)
+    if value is False:
+        return set()
+    items = value if isinstance(value, list) else str(value).replace(",", " ").split()
+    if len(items) == 1 and str(items[0]).strip().lower() in ("true", "false", "yes", "no", "1", "0", "on", "off"):
+        return set(WA_EVENTS) if str(items[0]).strip().lower() in ("true", "yes", "1", "on") else set()
+    events = {str(x).strip().lower() for x in items if str(x).strip()}
+    unknown = events - set(WA_EVENTS)
+    if unknown:
+        raise ValueError(f"станция №{i}: whatsapp_notify — неизвестные события {', '.join(sorted(unknown))}"
+                         f" (можно: {', '.join(WA_EVENTS)})")
+    return events
 
 
 def _as_bool(v: Any, default: bool = True) -> bool:
@@ -152,7 +174,7 @@ def _parse_stations(raw: Any) -> List[Station]:
             capacity_wh=float(it.get("capacity_wh") or 4096),
             telegram_ids={int(x) for x in (tg if isinstance(tg, list) else [tg])},
             whatsapp_chats=[str(x).strip() for x in (wa if isinstance(wa, list) else [wa])],
-            whatsapp_notify=_as_bool(it.get("whatsapp_notify"), True),
+            whatsapp_events=_parse_wa_events(it.get("whatsapp_notify"), i),
             dtek=_as_bool(it.get("dtek"), True),
             dtek_region=str(it.get("dtek_region") or "dnipro"),
             dtek_group=str(it.get("dtek_group") or "3.1"),
@@ -999,7 +1021,7 @@ async def cmd_stations(message: types.Message) -> None:
             f"{i}. <b>{html.escape(st.name)}</b> · SN …{html.escape(st.sn[-4:])}\n"
             f"   Telegram: {', '.join(map(str, sorted(st.telegram_ids))) or '—'}\n"
             f"   WhatsApp: {', '.join(st.whatsapp_chats) or '—'}"
-            f"{'' if st.whatsapp_notify else ' (уведомления выключены)'}\n"
+            f"{_wa_events_label(st)}\n"
             f"   ДТЭК: {('группа ' + st.dtek_group) if st.dtek else 'выключен'}"
         )
     src = STATIONS_FILE if os.path.exists(STATIONS_FILE) else ".env (файла stations.yaml нет)"
@@ -1044,6 +1066,17 @@ async def handle_status(message: types.Message) -> None:
 # =====================================================================
 # 5. ФОНОВЫЙ МОНИТОРИНГ И УВЕДОМЛЕНИЯ
 # =====================================================================
+_WA_EVENT_NAMES = {"mode": "свет", "low_battery": "низкий заряд", "online": "связь", "schedule": "график"}
+
+
+def _wa_events_label(st: Station) -> str:
+    if not st.whatsapp_chats or st.whatsapp_events == set(WA_EVENTS):
+        return ""
+    if not st.whatsapp_events:
+        return " (уведомления выключены)"
+    return " (уведомления: " + ", ".join(_WA_EVENT_NAMES[e] for e in WA_EVENTS if e in st.whatsapp_events) + ")"
+
+
 async def _notify_telegram(bot: Optional[Bot], chat_ids: Any, text: str) -> None:
     if bot is None:
         return
@@ -1080,13 +1113,14 @@ async def _check_station(bot: Optional[Bot], session: aiohttp.ClientSession, st:
         logger.warning("Мониторинг «%s»: ошибка EcoFlow API: %s", st.name, exc)
         return
 
-    async def send(text: str) -> None:
+    async def send(text: str, event: str) -> None:
         prefix = f"<b>{html.escape(st.name)}</b>: " if show_name else ""
-        await _notify(bot, st.telegram_ids, st.whatsapp_chats if st.whatsapp_notify else [], prefix + text)
+        wa = st.whatsapp_chats if event in st.whatsapp_events else []
+        await _notify(bot, st.telegram_ids, wa, prefix + text)
 
     online = bool(ef.get("online"))
     if state.online is not None and online != state.online:
-        await send("🟢 станция снова на связи" if online else "⚪ станция <b>пропала из сети</b>")
+        await send("🟢 станция снова на связи" if online else "⚪ станция <b>пропала из сети</b>", "online")
     state.online = online
     if not online:
         return
@@ -1099,14 +1133,14 @@ async def _check_station(bot: Optional[Bot], session: aiohttp.ClientSession, st:
         if mode == "station":
             rem = format_duration_minutes(ef["dsg_rem_min"], ef["calculated_rem_min"])
             tail = f" · хватит на <b>{rem}</b>" if ef["pow_out_sum"] > 0 else ""
-            await send(f"🔴 <b>{now_str} свет пропал</b>\n🔋 {_fmt_soc(ef['soc'])} · {ef['pow_out_sum']} Вт{tail}")
+            await send(f"🔴 <b>{now_str} свет пропал</b>\n🔋 {_fmt_soc(ef['soc'])} · {ef['pow_out_sum']} Вт{tail}", "mode")
         else:
-            await send(f"🟢 <b>{now_str} свет появился</b> · 🔋 {_fmt_soc(ef['soc'])}")
+            await send(f"🟢 <b>{now_str} свет появился</b> · 🔋 {_fmt_soc(ef['soc'])}", "mode")
     state.mode = mode
 
     if mode == "station" and ef["soc"] <= st.low_battery_soc and not state.low_sent:
         rem = format_duration_minutes(ef["dsg_rem_min"], ef["calculated_rem_min"])
-        await send(f"🪫 <b>Низкий заряд: {_fmt_soc(ef['soc'])}</b> · осталось {rem}")
+        await send(f"🪫 <b>Низкий заряд: {_fmt_soc(ef['soc'])}</b> · осталось {rem}", "low_battery")
         state.low_sent = True
     elif ef["soc"] > st.low_battery_soc + 5 or mode == "grid":
         state.low_sent = False
@@ -1152,7 +1186,7 @@ async def monitor_loop(bot: Optional[Bot]) -> None:
                         if prev is not None and fp != prev:
                             text = "🔔 <b>ДТЭК обновил график</b>\n" + await fetch_dtek_dnipro_schedule(session, region, group)
                             tg = {i for s in sts for i in s.telegram_ids}
-                            wa = {c for s in sts if s.whatsapp_notify for c in s.whatsapp_chats}
+                            wa = {c for s in sts if "schedule" in s.whatsapp_events for c in s.whatsapp_chats}
                             await _notify(bot, tg, wa, text)
                         schedules[(region, group)] = fp
         except asyncio.CancelledError:
