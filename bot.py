@@ -693,8 +693,12 @@ async def build_status_report(stations: Optional[List[Station]] = None) -> str:
     now_str = datetime.datetime.now(KYIV_TZ).strftime("%d.%m %H:%M")
     blocks = []
     for st, ef in zip(stations, ef_list):
+        if len(stations) > 1 and "error" not in ef and not ef.get("online"):
+            continue  # станции не на связи в общем отчете не показываем
         section = format_ecoflow_section(ef)
         blocks.append(f"<b>{html.escape(st.name)}</b>\n{section}" if len(stations) > 1 else section)
+    if not blocks:
+        blocks.append("⚪ Ни одна станция не на связи")
     text = f"🕒 {now_str}\n" + "\n\n".join(blocks)
     if schedules:
         text += "\n\n" + "\n\n".join(schedules)
